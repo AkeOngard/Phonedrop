@@ -1,0 +1,87 @@
+name: Build
+
+# build ตัวติดตั้งทั้งสามระบบ
+#   - ทุกครั้งที่ push เข้า main หรือกด Run workflow เอง: ได้ไฟล์เป็น Artifacts ของรอบนั้น
+#   - เมื่อ push tag ที่ขึ้นต้นด้วย v (เช่น v2.1.0): สร้าง Release พร้อมไฟล์ติดตั้งให้ดาวน์โหลด
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install NSIS if missing
+        shell: bash
+        run: |
+          if ! command -v makensis >/dev/null && [ ! -x "/c/Program Files (x86)/NSIS/makensis.exe" ]; then
+            choco install nsis --no-progress -y
+          fi
+      - name: Build
+        shell: bash
+        run: bash build.sh windows
+      - uses: actions/upload-artifact@v7
+        with:
+          name: PhoneDrop-windows
+          path: dist/PhoneDrop-Setup.exe
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: bash build.sh linux
+      - name: Smoke test (เซิร์ฟเวอร์รับไฟล์ต้องทำงานและไฟล์ต้องตรงต้นฉบับ)
+        run: bash packaging/linux/smoke-test.sh dist/PhoneDrop-linux-amd64.tar.gz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: PhoneDrop-linux
+          path: dist/PhoneDrop-linux-*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: bash build.sh darwin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: PhoneDrop-macos
+          path: dist/PhoneDrop-macOS.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" release/* --title "PhoneDrop $TAG" --generate-notes

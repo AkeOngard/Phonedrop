@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PhoneDrop</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --text: #16181d; --muted: #6b7280;
+    --line: #e3e5ea; --accent: #2563eb; --accent-text: #ffffff;
+    --ok: #15803d; --err: #b91c1c; --track: #e5e7eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #191c22; --text: #eef0f4; --muted: #9aa1ad;
+      --line: #2a2e37; --accent: #4f8cff; --accent-text: #0b0d11;
+      --ok: #4ade80; --err: #f87171; --track: #2a2e37;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", "Noto Sans Thai", sans-serif;
+    padding: 20px 16px calc(24px + env(safe-area-inset-bottom));
+  }
+  main { max-width: 520px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 4px 0 2px; }
+  .sub { color: var(--muted); margin: 0 0 18px; font-size: 14px; }
+  .pick {
+    display: block; width: 100%; padding: 22px 16px; border: 0; border-radius: 16px;
+    background: var(--accent); color: var(--accent-text);
+    font: inherit; font-size: 18px; font-weight: 600; text-align: center; cursor: pointer;
+  }
+  .pick:active { opacity: .85; }
+  input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  .summary { margin: 18px 2px 8px; font-size: 14px; color: var(--muted); min-height: 21px; }
+  .summary.done { color: var(--ok); font-weight: 600; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 10px 12px; margin-bottom: 8px;
+  }
+  .row { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .state { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .state.ok { color: var(--ok); } .state.err { color: var(--err); }
+  .bar { height: 4px; background: var(--track); border-radius: 2px; margin-top: 8px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s linear; }
+  li.ok .bar > i { background: var(--ok); } li.err .bar > i { background: var(--err); }
+  .retry {
+    margin-top: 8px; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line);
+    background: transparent; color: var(--text); font: inherit; font-size: 13px;
+  }
+  .tip:empty { display: none; }
+  .tip {
+    margin-top: 22px; font-size: 13px; color: var(--muted);
+    border-top: 1px solid var(--line); padding-top: 14px;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>ส่งไฟล์เข้าคอม</h1>
+  <p class="sub">ส่งไฟล์ต้นฉบับเต็มคุณภาพ ไม่บีบอัด</p>
+
+  <label class="pick" for="files">เลือกรูป / วิดีโอ / ไฟล์</label>
+  <input id="files" type="file" multiple>
+
+  <div class="summary" id="summary"></div>
+  <ul id="list"></ul>
+
+  <p class="tip" id="tip"></p>
+</main>
+
+<script>
+(() => {
+  const token = location.pathname.split('/').pop();
+  const input = document.getElementById('files');
+  const list = document.getElementById('list');
+  const summary = document.getElementById('summary');
+  const CONCURRENCY = 2;
+
+  if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
+    document.getElementById('tip').textContent =
+      'iPhone: ถ้าต้องการไฟล์ HEIC/วิดีโอต้นฉบับจริง ๆ ให้แตะ "ตัวเลือก" (Options) ในหน้าเลือกรูป ' +
+      'แล้วเลือกรูปแบบ "ปัจจุบัน" (Current) ไม่เช่นนั้น iOS อาจแปลงเป็น JPEG/H.264 ก่อนส่ง';
+  }
+
+  const queue = [];
+  let active = 0, total = 0, finished = 0, failed = 0;
+
+  const fmt = (n) => n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB'
+    : n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
+    : Math.max(1, Math.round(n / 1024)) + ' KB';
+
+  function updateSummary() {
+    if (!total) { summary.textContent = ''; return; }
+    const allDone = finished + failed === total;
+    summary.className = 'summary' + (allDone && !failed ? ' done' : '');
+    summary.textContent = allDone
+      ? (failed ? `ส่งสำเร็จ ${finished} ไฟล์ · ล้มเหลว ${failed} ไฟล์` : `ส่งครบแล้ว ${finished} ไฟล์ ✓`)
+      : `กำลังส่ง… ${finished}/${total} ไฟล์`;
+  }
+
+  function add(file) {
+    const li = document.createElement('li');
+    const row = document.createElement('div'); row.className = 'row';
+    const name = document.createElement('span'); name.className = 'name'; name.textContent = file.name;
+    const state = document.createElement('span'); state.className = 'state'; state.textContent = fmt(file.size);
+    const bar = document.createElement('div'); bar.className = 'bar';
+    const fill = document.createElement('i'); bar.append(fill);
+    row.append(name, state); li.append(row, bar);
+    list.prepend(li);
+    total++;
+    queue.push({ file, li, state, fill });
+    pump();
+  }
+
+  function pump() {
+    updateSummary();
+    while (active < CONCURRENCY && queue.length) upload(queue.shift());
+  }
+
+  function upload(item) {
+    active++;
+    const { file, li, state, fill } = item;
+    const xhr = new XMLHttpRequest();
+    const qs = new URLSearchParams({ name: file.name, mtime: String(file.lastModified || 0) });
+    xhr.open('PUT', `/api/upload/${token}?${qs}`);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const pct = e.total ? Math.round(e.loaded / e.total * 100) : 100;
+      fill.style.width = pct + '%';
+      state.textContent = pct + '%';
+    };
+    const end = (ok, msg) => {
+      active--;
+      li.className = ok ? 'ok' : 'err';
+      state.className = 'state ' + (ok ? 'ok' : 'err');
+      state.textContent = ok ? `✓ ${fmt(file.size)}` : msg;
+      fill.style.width = '100%';
+      if (ok) finished++;
+      else {
+        failed++;
+        const btn = document.createElement('button');
+        btn.className = 'retry'; btn.textContent = 'ลองส่งอีกครั้ง';
+        btn.onclick = () => {
+          btn.remove(); failed--;
+          li.className = ''; state.className = 'state'; state.textContent = fmt(file.size); fill.style.width = '0';
+          queue.push(item); pump();
+        };
+        li.append(btn);
+      }
+      pump();
+    };
+    xhr.onload = () => xhr.status === 200 ? end(true)
+      : end(false, xhr.status === 403 || xhr.status === 404 ? 'ลิงก์หมดอายุ สแกน QR ใหม่' : 'ส่งไม่สำเร็จ');
+    xhr.onerror = () => end(false, 'การเชื่อมต่อหลุด');
+    xhr.onabort = () => end(false, 'ยกเลิก');
+    xhr.send(file);
+  }
+
+  input.addEventListener('change', () => {
+    for (const f of input.files) add(f);
+    input.value = '';
+  });
+
+  // กันเผลอปิดหน้าระหว่างส่ง
+  addEventListener('beforeunload', (e) => {
+    if (active || queue.length) { e.preventDefault(); e.returnValue = ''; }
+  });
+})();
+</script>
+</body>
+</html>
