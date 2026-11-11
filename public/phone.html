@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>PhoneDrop</title>
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
   :root {
     --bg: #f4f5f7; --card: #ffffff; --text: #16181d; --muted: #6b7280;
@@ -155,7 +157,9 @@
       pump();
     };
     xhr.onload = () => xhr.status === 200 ? end(true)
-      : end(false, xhr.status === 403 || xhr.status === 404 ? 'ลิงก์หมดอายุ สแกน QR ใหม่' : 'ส่งไม่สำเร็จ');
+      : end(false, xhr.status === 403 || xhr.status === 404 ? 'ลิงก์หมดอายุ สแกน QR ใหม่'
+        : xhr.status === 507 || xhr.status === 413 ? 'พื้นที่ในคอมไม่พอ'
+        : xhr.status === 429 ? 'ลองใหม่ในอีก 1 นาที' : 'ส่งไม่สำเร็จ');
     xhr.onerror = () => end(false, 'การเชื่อมต่อหลุด');
     xhr.onabort = () => end(false, 'ยกเลิก');
     xhr.send(file);

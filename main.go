@@ -7,11 +7,14 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
+	"crypto/tls"
 	"embed"
-	"encoding/hex"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -24,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"fyne.io/systray"
 	"github.com/gen2brain/beeep"
@@ -36,13 +40,46 @@ var assets embed.FS
 
 const defaultPort = 5050
 
+const (
+	minTokenLen   = 16                // รหัสในลิงก์ที่สั้นกว่านี้ (จากเวอร์ชันเก่า) จะถูกสร้างใหม่
+	maxFails      = 10                // เดารหัสผิดได้กี่ครั้งก่อนถูกพัก
+	blockDuration = time.Minute       // พักนานเท่าไร
+	diskReserve   = 500 * 1024 * 1024 // เหลือพื้นที่ดิสก์ไว้อย่างน้อยเท่านี้เสมอ
+)
+
+// newToken: สุ่ม 80 บิต (16 ตัวอักษร) — เดาไม่ได้ในทางปฏิบัติ
+func newToken() string {
+	buf := make([]byte, 10)
+	if _, err := rand.Read(buf); err != nil {
+		panic(err)
+	}
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf))
+}
+
+type failState struct {
+	count int
+	last  time.Time
+	until time.Time
+}
+
+// ชื่อไฟล์ชั่วคราวระหว่างรับ — ใช้นามสกุลเฉพาะของเรา จะได้ไม่ชนกับไฟล์ .part ของโปรแกรมอื่น
+const tempSuffix = ".pdpart"
+
+// จำกัดชื่อไฟล์ที่ 180 ไบต์: Linux รับได้ 255 ไบต์ต่อชื่อ และอักษรไทยใช้ 3 ไบต์ต่อตัว
+// (เผื่อที่ให้ " (n)" กับ tempSuffix)
+const maxNameBytes = 180
+
+// freeSpaceFn แยกไว้ให้ชุดทดสอบจำลองดิสก์เต็มได้
+var freeSpaceFn = freeSpace
+
 // ---------- การตั้งค่า ----------
 
 type config struct {
 	Token    string `json:"token"`
 	Dir      string `json:"dir"`
 	Notify   bool   `json:"notify"`
-	LastPort int    `json:"lastPort"`
+	LastPort int    `json:"lastPort"` // พอร์ตหน้าจอคอม (127.0.0.1) ของตัวที่เปิดอยู่
+	LanPort  int    `json:"lanPort"`  // พอร์ต HTTPS ที่มือถือใช้
 }
 
 type fileInfo struct {
@@ -53,14 +90,17 @@ type fileInfo struct {
 }
 
 type app struct {
-	mu       sync.Mutex
-	cfg      config
-	cfgPath  string
-	port     int
-	received []fileInfo
-	inFlight map[string]bool
-	subs     map[chan []byte]bool
-	quitting bool
+	mu        sync.Mutex
+	cfg       config
+	cfgPath   string
+	lanPort   int    // HTTPS สำหรับมือถือ
+	localPort int    // HTTP บน 127.0.0.1 สำหรับหน้าจอคอม
+	certFP    string // ลายนิ้วมือใบรับรอง
+	received  []fileInfo
+	inFlight  map[string]bool
+	subs      map[chan []byte]bool
+	quitting  bool
+	fails     map[string]*failState // นับการเดารหัสผิดต่อ IP
 
 	notifyBatch []fileInfo
 	notifyTimer *time.Timer
@@ -78,9 +118,9 @@ func (a *app) loadConfig() bool {
 		first = false
 	}
 	if first {
-		buf := make([]byte, 4)
-		rand.Read(buf)
-		a.cfg = config{Token: hex.EncodeToString(buf), Notify: true}
+		a.cfg = config{Token: newToken(), Notify: true}
+	} else if len(a.cfg.Token) < minTokenLen {
+		a.cfg.Token = newToken() // รหัสจากเวอร์ชันเก่าสั้นเกินไป — ต้องสแกน QR ใหม่หนึ่งครั้ง
 	}
 	if a.cfg.Dir == "" {
 		a.cfg.Dir = defaultDir()
@@ -111,19 +151,34 @@ var (
 
 func safeName(raw string) string {
 	name := path.Base(strings.ReplaceAll(raw, `\`, "/"))
+	if name == "/" {
+		name = ""
+	}
 	name = badChars.ReplaceAllString(name, "_")
 	name = strings.TrimSpace(strings.TrimRight(name, ". "))
 	if name == "" || reserved.MatchString(name) {
 		name = fmt.Sprintf("file_%d", time.Now().UnixMilli())
 	}
-	if r := []rune(name); len(r) > 200 {
-		ext := []rune(filepath.Ext(name))
+	if len(name) > maxNameBytes {
+		ext := filepath.Ext(name)
 		if len(ext) > 20 {
-			ext = ext[:20]
+			ext = ""
 		}
-		name = string(r[:200-len(ext)]) + string(ext)
+		stem := truncateUTF8(name[:len(name)-len(ext)], maxNameBytes-len(ext))
+		name = strings.TrimRight(stem, ". ") + ext
 	}
 	return name
+}
+
+// truncateUTF8 ตัดสตริงให้ไม่เกิน n ไบต์โดยไม่ตัดกลางตัวอักษร
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 func exists(p string) bool {
@@ -142,10 +197,18 @@ func (a *app) reserve(dir, name string) string {
 		if i > 0 {
 			p = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", base, i, ext))
 		}
-		if !a.inFlight[p] && !exists(p) && !exists(p+".part") {
+		if !a.inFlight[p] && !exists(p) && !exists(p+tempSuffix) {
 			a.inFlight[p] = true
 			return p
 		}
+	}
+}
+
+// cleanTemp ลบไฟล์ชั่วคราวที่ค้างจากการรับไฟล์ที่ไม่จบ (เช่น ไฟดับ) — เรียกตอนเริ่มโปรแกรมเท่านั้น
+func (a *app) cleanTemp() {
+	left, _ := filepath.Glob(filepath.Join(a.dir(), "*"+tempSuffix))
+	for _, f := range left {
+		os.Remove(f)
 	}
 }
 
@@ -189,12 +252,12 @@ func (a *app) phoneURLs() (urls []string) {
 			continue
 		}
 		seen[ip] = true
-		urls = append(urls, fmt.Sprintf("http://%s:%d/s/%s", ip, a.port, a.cfg.Token))
+		urls = append(urls, fmt.Sprintf("https://%s:%d/s/%s", ip, a.lanPort, a.cfg.Token))
 	}
 	return urls
 }
 
-func (a *app) localURL() string { return fmt.Sprintf("http://localhost:%d/", a.port) }
+func (a *app) localURL() string { return fmt.Sprintf("http://localhost:%d/", a.localPort) }
 
 // ---------- แจ้งหน้าจอคอมแบบสด (Server-Sent Events) ----------
 
@@ -260,14 +323,28 @@ func (a *app) upload(w http.ResponseWriter, r *http.Request) {
 		delete(a.inFlight, final)
 		a.mu.Unlock()
 	}()
-	tmp := final + ".part"
+	tmp := final + tempSuffix
+
+	// กันดิสก์เต็ม: รับได้ไม่เกินพื้นที่ว่างลบส่วนที่กันไว้
+	var body io.Reader = r.Body
+	if free, ferr := freeSpaceFn(dir); ferr == nil {
+		var limit int64
+		if free > diskReserve {
+			limit = int64(free - diskReserve)
+		}
+		if r.ContentLength > limit {
+			writeJSON(w, http.StatusInsufficientStorage, map[string]any{"ok": false, "error": "พื้นที่ดิสก์ไม่พอ"})
+			return
+		}
+		body = http.MaxBytesReader(w, r.Body, limit)
+	}
 
 	n, err := func() (int64, error) {
 		f, err := os.Create(tmp)
 		if err != nil {
 			return 0, err
 		}
-		n, err := io.Copy(f, r.Body)
+		n, err := io.Copy(f, body)
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}
@@ -285,6 +362,8 @@ func (a *app) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ติดป้ายก่อน แล้วค่อยตั้งวันที่ — การติดป้ายบน Windows ทำให้วันที่แก้ไขไฟล์เปลี่ยน
+	markFromNetwork(final)
 	// คงวันที่แก้ไขไฟล์เดิมจากมือถือไว้
 	if ms, _ := strconv.ParseInt(r.URL.Query().Get("mtime"), 10, 64); ms > 0 {
 		os.Chtimes(final, time.Now(), time.UnixMilli(ms))
@@ -329,13 +408,57 @@ func (a *app) queueNotify(f fileInfo) {
 
 // ---------- HTTP ----------
 
-func isLoopback(r *http.Request) bool {
+func remoteIP(r *http.Request) net.IP {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return false
+		return nil
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return net.ParseIP(host)
+}
+
+// hostAllowed กัน DNS rebinding: รับเฉพาะคำขอที่เรียกมาด้วยเลข IP ตรง ๆ หรือ localhost
+// เว็บไซต์ภายนอกที่หลอกเบราว์เซอร์ให้ยิงเข้ามาจะมี Host เป็นชื่อโดเมนของมันเอง
+func hostAllowed(r *http.Request) bool {
+	h := r.Host
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		h = hh
+	}
+	h = strings.Trim(h, "[]")
+	return strings.EqualFold(h, "localhost") || net.ParseIP(h) != nil
+}
+
+func sameString(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// blocked: IP นี้เดารหัสผิดเกินกำหนดและยังอยู่ในช่วงพักหรือไม่
+func (a *app) blocked(ip string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	f := a.fails[ip]
+	return f != nil && time.Now().Before(f.until)
+}
+
+func (a *app) noteFail(ip string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.fails) > 4096 { // กันหน่วยความจำโต
+		a.fails = map[string]*failState{}
+	}
+	f := a.fails[ip]
+	if f == nil {
+		f = &failState{}
+		a.fails[ip] = f
+	}
+	if time.Since(f.last) > 10*time.Minute {
+		f.count = 0 // ลืมความผิดพลาดเก่า ๆ
+	}
+	f.last = time.Now()
+	f.count++
+	if f.count >= maxFails {
+		f.count = 0
+		f.until = time.Now().Add(blockDuration)
+	}
 }
 
 func serveAsset(w http.ResponseWriter, name, ctype string) {
@@ -349,23 +472,58 @@ func serveAsset(w http.ResponseWriter, name, ctype string) {
 	w.Write(b)
 }
 
-func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// tokenRoute จัดการคำขอที่มือถือใช้ — คืน true ถ้าจัดการแล้ว
+func (a *app) tokenRoute(w http.ResponseWriter, r *http.Request) bool {
+	p := r.URL.Path
+	switch {
+	case r.Method == "GET" && sameString(p, "/s/"+a.cfg.Token):
+		serveAsset(w, "public/phone.html", "text/html; charset=utf-8")
+	case r.Method == "PUT" && sameString(p, "/api/upload/"+a.cfg.Token):
+		a.upload(w, r)
+	case r.Method == "GET" && (p == "/icon.png" || p == "/favicon.ico" || strings.HasPrefix(p, "/apple-touch-icon")):
+		serveAsset(w, "assets/icon.png", "image/png") // ไอคอนไม่ใช่ความลับ — ใช้ตอนเพิ่มไว้หน้าโฮมของมือถือ
+	default:
+		return false
+	}
+	return true
+}
+
+// serveLAN: ช่องทางสำหรับมือถือ (HTTPS, เปิดรับจากเครือข่าย) — มีแค่หน้าส่งไฟล์กับการรับไฟล์
+func (a *app) serveLAN(w http.ResponseWriter, r *http.Request) {
+	if !hostAllowed(r) {
+		http.Error(w, "forbidden host", 403)
+		return
+	}
+	ip := remoteIP(r)
+	local := ip != nil && ip.IsLoopback()
+	key := ""
+	if ip != nil {
+		key = ip.String()
+	}
+	if !local && a.blocked(key) {
+		http.Error(w, "ลองผิดหลายครั้งเกินไป กรุณารอสักครู่", http.StatusTooManyRequests)
+		return
+	}
+	if a.tokenRoute(w, r) {
+		return
+	}
+	// นับเฉพาะคำขอที่เป็นการลองรหัส — เบราว์เซอร์มือถือขอไฟล์อื่นเองอยู่บ่อย ๆ ไม่ควรโดนนับไปด้วย
+	if p := r.URL.Path; !local && (strings.HasPrefix(p, "/s/") || strings.HasPrefix(p, "/api/upload/")) {
+		a.noteFail(key)
+	}
+	http.NotFound(w, r)
+}
+
+// serveLocal: ช่องทางสำหรับหน้าจอคอม (HTTP ธรรมดา ผูกกับ 127.0.0.1 เท่านั้น ไม่ออกเครือข่าย)
+func (a *app) serveLocal(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	token := a.cfg.Token
 
-	// หน้าบนมือถือ (ต้องมี token จาก QR)
-	if r.Method == "GET" && p == "/s/"+token {
-		serveAsset(w, "public/phone.html", "text/html; charset=utf-8")
+	if ip := remoteIP(r); ip == nil || !ip.IsLoopback() || !hostAllowed(r) {
+		http.Error(w, "forbidden", 403)
 		return
 	}
-	if r.Method == "PUT" && p == "/api/upload/"+token {
-		a.upload(w, r)
-		return
-	}
-
-	// ส่วนที่เหลือใช้ได้จากเครื่องนี้เท่านั้น
-	if !isLoopback(r) {
-		http.Error(w, "กรุณาสแกน QR code บนหน้าจอคอมอีกครั้ง", 403)
+	if a.tokenRoute(w, r) {
 		return
 	}
 
@@ -388,7 +546,7 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, map[string]any{
 			"url": url, "urls": urls, "online": len(urls) > 0,
-			"dir": dir, "token": token, "files": files,
+			"dir": dir, "token": token, "files": files, "fingerprint": a.certFP,
 		})
 	case r.Method == "GET" && p == "/api/qr.png":
 		urls := a.phoneURLs()
@@ -647,6 +805,7 @@ func main() {
 		cfgPath:  filepath.Join(cfgDir, "config.json"),
 		inFlight: map[string]bool{},
 		subs:     map[chan []byte]bool{},
+		fails:    map[string]*failState{},
 	}
 	firstRun := a.loadConfig()
 
@@ -662,22 +821,58 @@ func main() {
 		}
 	}
 
-	var ln net.Listener
-	var err error
+	cert, fp, err := loadOrCreateCert(cfgDir, lanAddresses())
+	if err != nil {
+		fatal("สร้างใบรับรอง HTTPS ไม่ได้: " + err.Error())
+	}
+	a.certFP = fp
+
+	// ช่องทางหน้าจอคอม: HTTP บน 127.0.0.1 เท่านั้น (พอร์ตสุ่ม)
+	localLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		fatal("เปิดพอร์ตภายในเครื่องไม่ได้: " + err.Error())
+	}
+	a.localPort = localLn.Addr().(*net.TCPAddr).Port
+
+	// ช่องทางมือถือ: HTTPS เปิดรับจากเครือข่าย
+	var lanLn net.Listener
 	for p := defaultPort; p < defaultPort+20; p++ {
-		if ln, err = net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", p)); err == nil {
-			a.port = p
+		if lanLn, err = net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", p)); err == nil {
+			a.lanPort = p
 			break
 		}
+		if p == defaultPort {
+			// พอร์ตหลักไม่ว่าง: อาจเป็น PhoneDrop อีกตัวที่เพิ่งเปิดพร้อมกัน — รอสักครู่แล้วเช็กอีกครั้ง
+			time.Sleep(700 * time.Millisecond)
+			var other config
+			if b, rerr := os.ReadFile(a.cfgPath); rerr == nil && json.Unmarshal(b, &other) == nil && alreadyRunning(other, !hidden) {
+				return
+			}
+		}
 	}
-	if ln == nil {
+	if lanLn == nil {
 		fatal("เปิดพอร์ตรับไฟล์ไม่ได้: " + err.Error())
 	}
-	a.cfg.LastPort = a.port
+	a.cfg.LastPort = a.localPort
+	a.cfg.LanPort = a.lanPort
 	a.saveConfig()
+	a.cleanTemp()
 
 	beeep.AppName = "PhoneDrop"
-	go http.Serve(ln, a) // ไม่ตั้ง timeout: วิดีโอใหญ่ ๆ อาจใช้เวลาส่งนาน
+	quiet := log.New(io.Discard, "", 0)
+	// ไม่ตั้ง timeout ของเนื้อไฟล์ (วิดีโอใหญ่ ๆ ใช้เวลาส่งนาน) แต่จำกัดเวลาส่ง header กันการเปิดการเชื่อมต่อค้าง
+	localSrv := &http.Server{Handler: http.HandlerFunc(a.serveLocal), ReadHeaderTimeout: 10 * time.Second, ErrorLog: quiet}
+	lanSrv := &http.Server{
+		Handler:           http.HandlerFunc(a.serveLAN),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		ErrorLog:          quiet,
+		TLSConfig:         &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
+		// HTTP/1.1 เท่านั้น: ส่งไฟล์ใหญ่ในวงแลนได้เร็วกว่า HTTP/2
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
+	}
+	go localSrv.Serve(localLn)
+	go lanSrv.ServeTLS(lanLn, "", "")
 
 	// ครั้งแรกหลังติดตั้ง: ตั้งให้เปิดพร้อมเครื่อง (ปิดได้จากเมนูที่ไอคอนถาดระบบ)
 	if firstRun && !noAutoStart {

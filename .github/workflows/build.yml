@@ -27,6 +27,8 @@ jobs:
           if ! command -v makensis >/dev/null && [ ! -x "/c/Program Files (x86)/NSIS/makensis.exe" ]; then
             choco install nsis --no-progress -y
           fi
+      - name: Test
+        run: go test -count=1 .
       - name: Build
         shell: bash
         run: bash build.sh windows
@@ -43,6 +45,8 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      - name: Test
+        run: go test -count=1 .
       - name: Build
         run: bash build.sh linux
       - name: Smoke test (เซิร์ฟเวอร์รับไฟล์ต้องทำงานและไฟล์ต้องตรงต้นฉบับ)

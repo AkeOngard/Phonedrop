@@ -46,6 +46,10 @@
   li span:last-child { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
   .empty { color: var(--muted); font-size: 14px; padding: 24px 0; text-align: center; border-top: 1px solid var(--line); }
   .dir { margin-top: 12px; }
+  .tls { margin-top: 14px; font-size: 13px; color: var(--muted); }
+  .tls summary { cursor: pointer; color: var(--accent); }
+  .tls p { font-size: 13px; margin: 8px 0 0; }
+  .tls code { font-size: 11px; }
 </style>
 </head>
 <body>
@@ -56,6 +60,13 @@
     <div class="qr"><img id="qr" alt="QR code สำหรับสแกนด้วยมือถือ"></div>
     <code id="url"></code>
     <p id="alt" style="margin-top:10px"></p>
+    <details class="tls">
+      <summary>มือถือขึ้นคำเตือนความปลอดภัย?</summary>
+      <p>เป็นเรื่องปกติในครั้งแรก เพราะการเชื่อมต่อเข้ารหัสด้วยใบรับรองที่คอมเครื่องนี้สร้างเอง</p>
+      <p><b>Android (Chrome):</b> แตะ "ขั้นสูง" แล้ว "ไปยังไซต์ต่อ"<br><b>iPhone (Safari):</b> แตะ "แสดงรายละเอียด" แล้ว "เยี่ยมชมเว็บไซต์นี้"</p>
+      <p>ทำครั้งเดียว มือถือจะจำไว้ ถ้าวันหลังขึ้นเตือนอีกทั้งที่ไม่ได้ลงโปรแกรมใหม่ อย่ากดผ่าน อาจมีคนแทรกกลางเครือข่าย</p>
+      <p>ลายนิ้วมือใบรับรอง (SHA-256):<br><code id="fp"></code></p>
+    </details>
   </section>
 
   <section class="card">
@@ -95,6 +106,7 @@
   else document.getElementById('url').textContent = 'ไม่พบการเชื่อมต่อเครือข่าย — ต่อ Wi-Fi/LAN แล้วเปิดหน้านี้ใหม่';
   if (info.online) document.getElementById('url').textContent = info.url;
   document.getElementById('dir').textContent = info.dir;
+  document.getElementById('fp').textContent = info.fingerprint;
   if (info.urls.length > 1) {
     document.getElementById('alt').textContent = 'ถ้าเปิดไม่ได้ ลอง: ' + info.urls.slice(1).join(' , ');
   }
